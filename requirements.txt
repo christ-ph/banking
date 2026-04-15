@@ -1,11 +1,24 @@
-Flask==2.3.3
+# ──────────────────────────────────────────────────────────────────────────────
+#  requirements.txt — Compatible Python 3.14 + Render.com
+#
+#  CORRECTIONS :
+#   1. Flask 2.3.3 → 3.1.0   (Flask 2.x incompatible Python 3.14 typing)
+#   2. psycopg2-binary 2.9.9  → psycopg[binary]>=3.1  (psycopg2 pas de wheel Python 3.14)
+#   3. Flask-Migrate 4.0.5    → 4.0.7   (alembic compat fix)
+#   4. gunicorn 21.2.0        → 23.0.0  (Python 3.14 asyncio compat)
+#   5. bcrypt 4.1.2           → 4.2.1   (wheel cp39-abi3 stable sur 3.14)
+#   6. Ajout de python-runtime.txt pour forcer Python 3.12 sur Render (recommandé)
+# ──────────────────────────────────────────────────────────────────────────────
+
+Flask==3.1.0
 Flask-SQLAlchemy==3.1.1
-Flask-Migrate==4.0.5
-Flask-JWT-Extended==4.5.3
-Flask-CORS==4.0.1
-flasgger
-PyYAML==6.0.1
-python-dotenv==1.0.0
-bcrypt==4.1.2
-psycopg2-binary==2.9.9
-gunicorn==21.2.0
+Flask-Migrate==4.0.7
+Flask-JWT-Extended==4.7.1
+Flask-CORS==5.0.0
+flasgger==0.9.7.1
+PyYAML==6.0.2
+python-dotenv==1.0.1
+bcrypt==4.2.1
+# psycopg2-binary ne compile PAS sur Python 3.14 — utiliser psycopg3 (psycopg)
+psycopg[binary]==3.2.3
+gunicorn==23.0.0

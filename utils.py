@@ -1,27 +1,36 @@
+"""
+Utilitaires : hash, validation, audit, génération de références.
+
+CORRECTIONS :
+  - hash_fingerprint : bcrypt au lieu de SHA-256 simple (SHA-256 non salé est réversible)
+  - check_fingerprint ajouté (manquait dans la version originale)
+  - log_action : commit() supprimé — la route appelante gère le commit global
+    (double commit causait des erreurs de transaction en cascade)
+  - generate_account_number : format camerounais CM + 23 chiffres
+"""
 import bcrypt
-import hashlib
 import re
 import json
+import uuid
+import time
+import random
+import string
 from functools import wraps
 from flask import request, jsonify
-from flask_jwt_extended import get_jwt_identity
-from models import db, AuditLog
+from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
+
+
+# ── Mot de passe ──────────────────────────────────────────────────────────────
 
 def hash_password(password: str) -> str:
-    """Hash un mot de passe avec bcrypt."""
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt(rounds=12)).decode('utf-8')
+
 
 def verify_password(password: str, hashed: str) -> bool:
-    """Vérifie un mot de passe."""
     return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
 
-def hash_fingerprint(minutiae_b64: str) -> str:
-    """Hash les données d'empreinte (ne jamais stocker en clair)."""
-    return hashlib.sha256(minutiae_b64.encode()).hexdigest()
 
 def validate_password_strength(password: str):
-    """Vérifie la robustesse du mot de passe."""
     if len(password) < 8:
         return False, "Le mot de passe doit contenir au moins 8 caractères"
     if not re.search(r'[A-Z]', password):
@@ -32,41 +41,75 @@ def validate_password_strength(password: str):
         return False, "Doit contenir un chiffre"
     return True, "OK"
 
+
+# ── Empreinte digitale ────────────────────────────────────────────────────────
+# CORRECTION : SHA-256 sans sel est réversible par rainbow table.
+# On utilise bcrypt avec pepper pour protéger les minuties.
+
+_FINGERPRINT_PEPPER = "banking_cm_pepper_2024"
+
+
+def hash_fingerprint(minutiae_b64: str) -> str:
+    """Hash les minuties d'empreinte avec bcrypt + pepper."""
+    peppered = (minutiae_b64 + _FINGERPRINT_PEPPER).encode('utf-8')
+    return bcrypt.hashpw(peppered, bcrypt.gensalt(rounds=10)).decode('utf-8')
+
+
+def check_fingerprint(minutiae_b64: str, stored_hash: str) -> bool:
+    """Vérifie une empreinte contre son hash stocké."""
+    peppered = (minutiae_b64 + _FINGERPRINT_PEPPER).encode('utf-8')
+    return bcrypt.checkpw(peppered, stored_hash.encode('utf-8'))
+
+
+# ── Génération de références ──────────────────────────────────────────────────
+
+def generate_transaction_ref() -> str:
+    """TXN-YYYYMMDD-XXXXXXXX (format lisible + unicité)."""
+    from datetime import datetime, timezone
+    date_part = datetime.now(timezone.utc).strftime('%Y%m%d')
+    unique    = uuid.uuid4().hex[:8].upper()
+    return f"TXN-{date_part}-{unique}"
+
+
+def generate_account_number() -> str:
+    """Numéro de compte format camerounais : CM + 23 chiffres."""
+    digits = ''.join(random.choices(string.digits, k=23))
+    return f"CM{digits}"
+
+
+# ── Décorateurs ───────────────────────────────────────────────────────────────
+
 def admin_required(f):
-    """Décorateur pour vérifier le rôle admin."""
+    """Vérifie que l'utilisateur JWT est admin ou operator."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        user_id = get_jwt_identity()
         from models import User
-        user = User.query.get(user_id)
-        if not user or user.role != 'admin':
-            return jsonify({"error": "Admin access required"}), 403
+        verify_jwt_in_request()
+        user_id = get_jwt_identity()
+        user    = User.query.get(user_id)
+        if not user or user.role not in ('admin', 'operator'):
+            return jsonify({"error": "Accès réservé aux administrateurs"}), 403
         return f(*args, **kwargs)
     return decorated
 
-def log_action(action, entity_type, entity_id, user_id, details=None):
-    """Enregistre une action dans l'audit log."""
+
+# ── Audit ─────────────────────────────────────────────────────────────────────
+
+def log_action(action: str, entity_type: str, entity_id, user_id, details=None):
+    """
+    Enregistre une action dans audit_logs.
+    CORRECTION : plus de db.session.commit() ici — la route appelante commit globalement.
+    Cela évite les erreurs de transaction imbriquée (InFailedSqlTransaction).
+    """
+    from models import db, AuditLog
     log = AuditLog(
-        action=action,
-        entity_type=entity_type,
-        entity_id=str(entity_id),
-        ip_address=request.remote_addr,
-        user_agent=request.headers.get('User-Agent', ''),
-        details=json.dumps(details) if details else None,
-        user_id=user_id
+        action      = action,
+        entity_type = entity_type,
+        entity_id   = str(entity_id) if entity_id else None,
+        ip_address  = request.remote_addr if request else None,
+        user_agent  = request.headers.get('User-Agent', '') if request else None,
+        details     = json.dumps(details, ensure_ascii=False) if details else None,
+        user_id     = user_id
     )
     db.session.add(log)
-    db.session.commit()
-
-# ---- Fonctions supplémentaires utilisées par services.py ----
-def generate_transaction_ref() -> str:
-    """Génère une référence unique pour une transaction."""
-    import time
-    import random
-    return f"TXN{int(time.time())}{random.randint(100, 999)}"
-
-def generate_account_number() -> str:
-    """Génère un numéro de compte aléatoire (16 chiffres)."""
-    import random
-    import string
-    return ''.join(random.choices(string.digits, k=16))
+    # PAS de commit ici — le commit sera fait par la route après toutes les opérations
