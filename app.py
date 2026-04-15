@@ -29,6 +29,8 @@ def create_app():
     app.register_blueprint(api, url_prefix='/api/v1')
     return app
 
+# Création de l'instance pour Gunicorn (production)
+app = create_app()
+
 if __name__ == '__main__':
-    app = create_app()
     app.run(debug=True)
