@@ -32,5 +32,10 @@ def create_app():
 # Création de l'instance pour Gunicorn (production)
 app = create_app()
 
+# Créer les tables si elles n'existent pas (idempotent)
+with app.app_context():
+    db.create_all()
+    print("Tables vérifiées/créées (si absentes)")
+
 if __name__ == '__main__':
     app.run(debug=True)
