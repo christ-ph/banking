@@ -1,12 +1,3 @@
-"""
-Configuration de l'application bancaire.
-Charge automatiquement le fichier .env via python-dotenv.
-
-CORRECTIONS :
-  - DATABASE_URL avec dialect postgresql+psycopg (psycopg3) au lieu de psycopg2
-  - connect_args supprimé (incompatible psycopg3)
-  - TRANSACTION_VALIDATION_THRESHOLD défini explicitement
-"""
 import os
 from datetime import timedelta
 from dotenv import load_dotenv
@@ -14,30 +5,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# def _build_db_url():
-#     """
-#     Force le dialect psycopg3 dans l'URL de connexion.
-#     Render injecte DATABASE_URL avec 'postgres://' ou 'postgresql://' (psycopg2).
-#     On remplace par 'postgresql+psycopg://' pour utiliser psycopg3.
-#     """
-#     url = os.environ.get('DATABASE_URL', 'postgresql://christ:123456@localhost:5432/bankdb')
-#     if url.startswith('postgres://'):
-#         url = url.replace('postgres://', 'postgresql://', 1)
-#     if url.startswith('postgresql://') and '+psycopg' not in url:
-#         url = url.replace('postgresql://', 'postgresql+psycopg://', 1)
-#     return url
-
 def _build_db_url():
     """
-    Neon PostgreSQL : conserve sslmode + channel_binding dans l'URL,
-    force le dialect psycopg3.
+    Construit l'URL de connexion PostgreSQL avec le dialecte psycopg3.
+    La variable DATABASE_URL doit être définie dans l'environnement.
     """
-    url = os.environ.get(
-        'DATABASE_URL',
-        'postgresql://neondb_owner:npg_LRruTaEhc12t@ep-lively-salad-anhhl90k-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require'
-    )
+    url = os.environ.get('DATABASE_URL')
+    if not url:
+        # Pas de fallback dangereux : on lève une erreur explicite
+        raise RuntimeError("DATABASE_URL non définie. Veuillez la configurer.")
+    
+    # Remplacer postgres:// par postgresql:// si nécessaire
     if url.startswith('postgres://'):
         url = url.replace('postgres://', 'postgresql://', 1)
+    # Forcer l'utilisation du driver psycopg (psycopg3)
     if url.startswith('postgresql://') and '+psycopg' not in url:
         url = url.replace('postgresql://', 'postgresql+psycopg://', 1)
     return url
@@ -94,8 +75,9 @@ class ProductionConfig(Config):
 
     @classmethod
     def init_app(cls, app):
-        assert os.environ.get('DATABASE_URL'),   "DATABASE_URL non définie en production !"
-        assert os.environ.get('SECRET_KEY'),     "SECRET_KEY non définie en production !"
+        # Vérifications strictes en production
+        assert os.environ.get('DATABASE_URL'), "DATABASE_URL non définie en production !"
+        assert os.environ.get('SECRET_KEY'), "SECRET_KEY non définie en production !"
         assert os.environ.get('JWT_SECRET_KEY'), "JWT_SECRET_KEY non définie en production !"
 
 
