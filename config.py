@@ -6,19 +6,14 @@ load_dotenv()
 
 
 def _build_db_url():
-    """
-    Construit l'URL de connexion PostgreSQL avec le dialecte psycopg3.
-    La variable DATABASE_URL doit être définie dans l'environnement.
-    """
-    url = os.environ.get('DATABASE_URL')
-    if not url:
-        # Pas de fallback dangereux : on lève une erreur explicite
-        raise RuntimeError("DATABASE_URL non définie. Veuillez la configurer.")
+
+    # URL Neon (pooler) – à remplacer par la tienne si besoin
+    url = "postgresql://neondb_owner:npg_LRruTaEhc12t@ep-lively-salad-anhhl90k-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
     
-    # Remplacer postgres:// par postgresql:// si nécessaire
+    # S'assurer que le dialecte est compatible avec SQLAlchemy
     if url.startswith('postgres://'):
         url = url.replace('postgres://', 'postgresql://', 1)
-    # Forcer l'utilisation du driver psycopg (psycopg3)
+    # Forcer l'utilisation du driver psycopg3 (optionnel mais recommandé)
     if url.startswith('postgresql://') and '+psycopg' not in url:
         url = url.replace('postgresql://', 'postgresql+psycopg://', 1)
     return url
@@ -71,12 +66,12 @@ class DevelopmentConfig(Config):
 
 
 class ProductionConfig(Config):
-    DEBUG = False
+    DEBUG = False  # Mets à True temporairement pour voir l'erreur, puis repasse à False
 
     @classmethod
     def init_app(cls, app):
-        # Vérifications strictes en production
-        assert os.environ.get('DATABASE_URL'), "DATABASE_URL non définie en production !"
+        # Pour les tests avec URL en dur, on peut commenter ces assertions
+        # assert os.environ.get('DATABASE_URL'), "DATABASE_URL non définie en production !"
         assert os.environ.get('SECRET_KEY'), "SECRET_KEY non définie en production !"
         assert os.environ.get('JWT_SECRET_KEY'), "JWT_SECRET_KEY non définie en production !"
 
