@@ -112,4 +112,4 @@ def log_action(action: str, entity_type: str, entity_id, user_id, details=None):
         user_id     = user_id
     )
     db.session.add(log)
-    # PAS de commit ici — le commit sera fait par la route après toutes les opérations
+   

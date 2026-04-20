@@ -25,12 +25,12 @@ class Config:
 
     SQLALCHEMY_DATABASE_URI        = _build_db_url()
     SQLALCHEMY_TRACK_MODIFICATIONS = False
-    SQLALCHEMY_ENGINE_OPTIONS      = {
-        "pool_pre_ping": True,
-        "pool_recycle":  300,
-        "pool_size":     5,
-        "max_overflow":  10,
-        "connect_args":  {"sslmode": "require"},
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        "pool_pre_ping": True,    # Vérifie la connexion avant de l’utiliser
+        "pool_recycle": 300,      # Rafraîchit la connexion toutes les 5 min
+        "pool_size": 5,           # Nombre de connexions permanentes
+        "max_overflow": 10,       # Connexions supplémentaires temporaires
+        "connect_args": {"sslmode": "require"},  # Force SSL pour PostgreSQL
     }
 
     JWT_ACCESS_TOKEN_EXPIRES  = timedelta(minutes=120)

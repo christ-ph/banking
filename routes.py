@@ -9,7 +9,11 @@ CORRECTIONS :
   2. login_password_image_step2 : même correction
   3. fingerprint_login_complete : user_id lu depuis verify_webauthn_login
   4. log_action appelé AVANT db.session.commit() (un seul commit par route)
+  5. Import corrigé : from datetime import datetime, timezone (pas import datetime / from time import timezone)
+  6. Suppression du doublon d'import utils
+  7. datetime.now(timezone.utc) uniformisé partout
 """
+from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import (jwt_required, create_access_token,
                                  create_refresh_token, get_jwt_identity)
@@ -23,7 +27,7 @@ from services import (
     image_challenge_store
 )
 from utils import (hash_password, hash_fingerprint, validate_password_strength,
-                   admin_required, log_action)
+                   admin_required, log_action, generate_transaction_ref)
 import json
 
 api = Blueprint('api', __name__)
@@ -79,7 +83,7 @@ def register():
         phone         = data.get('phone', '')
     )
     db.session.add(user)
-    db.session.flush()   # génère user.id sans commit
+    db.session.flush()
     log_action('user_registered', 'user', user.id, user.id)
     db.session.commit()
     return jsonify({"message": "Compte créé", "user_id": user.id}), 201
@@ -264,7 +268,6 @@ def login_image_step2():
     if not all([challenge_id, selected_image_id, click_x is not None, click_y is not None]):
         return jsonify({"error": "challenge_id, selected_image_id, click_x, click_y requis"}), 400
 
-    # CORRECTION : verify_image_response retourne maintenant (ok, msg, user_id)
     ok, msg, user_id = verify_image_response(challenge_id, selected_image_id, click_x, click_y)
     if not ok:
         return jsonify({"error": msg}), 401
@@ -315,7 +318,6 @@ def login_password_image_step1():
     if err:
         return jsonify({"error": err}), 400
 
-    # Stocker que le mot de passe a été vérifié pour ce challenge
     cid = challenge['challenge_id']
     if cid in image_challenge_store:
         image_challenge_store[cid]['password_verified_user'] = user.id
@@ -351,7 +353,6 @@ def login_password_image_step2():
     click_x           = data.get('click_x')
     click_y           = data.get('click_y')
 
-    # Lire password_verified_user AVANT verify_image_response (qui supprime le challenge)
     stored = image_challenge_store.get(challenge_id, {})
     password_verified_user = stored.get('password_verified_user')
 
@@ -502,7 +503,6 @@ def fingerprint_login_complete():
     if not challenge or not signature:
         return jsonify({"error": "challenge et signature requis"}), 400
 
-    # CORRECTION : verify_webauthn_login retourne maintenant (ok, msg, user_id)
     ok, msg, user_id = verify_webauthn_login(challenge, signature)
     if not ok:
         return jsonify({"error": msg}), 401
@@ -709,9 +709,8 @@ def admin_validate_transaction(txn_id):
       400: {description: Déjà validée ou solde insuffisant}
       404: {description: Introuvable}
     """
-    from datetime import datetime, timezone
-    user_id = get_jwt_identity()
-    txn     = Transaction.query.get(txn_id)
+    user_id  = get_jwt_identity()
+    txn      = Transaction.query.get(txn_id)
     if not txn:
         return jsonify({"error": "Transaction introuvable"}), 404
     if txn.status != 'pending':
@@ -773,3 +772,398 @@ def health():
       200: {description: OK}
     """
     return jsonify({"status": "ok", "service": "banking-api"}), 200
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN : GESTION COMPLÈTE DES UTILISATEURS (CRUD)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@api.post('/admin/users')
+@jwt_required()
+@admin_required
+def admin_create_user():
+    """
+    Créer un utilisateur (admin seulement)
+    ---
+    tags: [Administration]
+    security: [{Bearer: []}]
+    parameters:
+      - name: body
+        in: body
+        required: true
+        schema:
+          type: object
+          required: [email, password]
+          properties:
+            email:       {type: string}
+            password:    {type: string}
+            first_name:  {type: string}
+            last_name:   {type: string}
+            phone:       {type: string}
+            role:        {type: string, enum: [client, operator, admin], default: client}
+            is_active:   {type: boolean, default: true}
+    responses:
+      201: {description: Utilisateur créé}
+      400: {description: Données invalides}
+      409: {description: Email déjà utilisé}
+    """
+    data     = request.get_json(silent=True) or {}
+    email    = data.get('email', '').strip().lower()
+    password = data.get('password', '')
+
+    if not email or not password:
+        return jsonify({"error": "email et password requis"}), 400
+
+    valid, msg = validate_password_strength(password)
+    if not valid:
+        return jsonify({"error": msg}), 400
+
+    if User.query.filter_by(email=email).first():
+        return jsonify({"error": "Email déjà utilisé"}), 409
+
+    user = User(
+        email         = email,
+        password_hash = hash_password(password),
+        first_name    = data.get('first_name', ''),
+        last_name     = data.get('last_name', ''),
+        phone         = data.get('phone', ''),
+        role          = data.get('role', 'client'),
+        is_active     = data.get('is_active', True)
+    )
+    db.session.add(user)
+    db.session.flush()
+    log_action('admin_created_user', 'user', user.id, get_jwt_identity(),
+               details={'created_by_admin': True})
+    db.session.commit()
+    return jsonify({"message": "Utilisateur créé", "user": user.to_dict()}), 201
+
+
+@api.get('/admin/users/<user_id>')
+@jwt_required()
+@admin_required
+def admin_get_user(user_id):
+    """
+    Détail d'un utilisateur (admin)
+    ---
+    tags: [Administration]
+    security: [{Bearer: []}]
+    parameters:
+      - name: user_id
+        in: path
+        type: string
+        required: true
+    responses:
+      200: {description: Utilisateur trouvé}
+      404: {description: Introuvable}
+    """
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({"error": "Utilisateur introuvable"}), 404
+    return jsonify(user.to_dict()), 200
+
+
+@api.put('/admin/users/<user_id>')
+@jwt_required()
+@admin_required
+def admin_update_user(user_id):
+    """
+    Mettre à jour un utilisateur (admin) – rôle, is_active, etc.
+    ---
+    tags: [Administration]
+    security: [{Bearer: []}]
+    parameters:
+      - name: user_id
+        in: path
+        type: string
+        required: true
+      - name: body
+        in: body
+        schema:
+          type: object
+          properties:
+            role:         {type: string, enum: [client, operator, admin]}
+            is_active:    {type: boolean}
+            auth_methods: {type: string}
+            first_name:   {type: string}
+            last_name:    {type: string}
+            phone:        {type: string}
+    responses:
+      200: {description: Utilisateur mis à jour}
+      400: {description: Données invalides}
+      403: {description: Tentative de désactivation de son propre compte admin}
+      404: {description: Introuvable}
+    """
+    current_admin_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({"error": "Utilisateur introuvable"}), 404
+
+    data = request.get_json(silent=True) or {}
+
+    if user.id == current_admin_id:
+        if 'is_active' in data and data['is_active'] is False:
+            return jsonify({"error": "Vous ne pouvez pas désactiver votre propre compte"}), 403
+        if 'role' in data and data['role'] != user.role:
+            return jsonify({"error": "Vous ne pouvez pas modifier votre propre rôle"}), 403
+
+    if 'role' in data:
+        if data['role'] not in ('client', 'operator', 'admin'):
+            return jsonify({"error": "Rôle invalide"}), 400
+        user.role = data['role']
+    if 'is_active' in data:
+        user.is_active = bool(data['is_active'])
+    if 'auth_methods' in data:
+        user.auth_methods = data['auth_methods']
+    if 'first_name' in data:
+        user.first_name = data['first_name']
+    if 'last_name' in data:
+        user.last_name = data['last_name']
+    if 'phone' in data:
+        user.phone = data['phone']
+
+    log_action('admin_updated_user', 'user', user.id, current_admin_id,
+               details={'updated_fields': list(data.keys())})
+    db.session.commit()
+    return jsonify({"message": "Utilisateur mis à jour", "user": user.to_dict()}), 200
+
+
+@api.delete('/admin/users/<user_id>')
+@jwt_required()
+@admin_required
+def admin_delete_user(user_id):
+    """
+    Désactiver un utilisateur (soft delete) – admin seulement
+    ---
+    tags: [Administration]
+    security: [{Bearer: []}]
+    parameters:
+      - name: user_id
+        in: path
+        type: string
+        required: true
+    responses:
+      200: {description: Utilisateur désactivé}
+      403: {description: Tentative de suppression de son propre compte}
+      404: {description: Introuvable}
+    """
+    current_admin_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({"error": "Utilisateur introuvable"}), 404
+
+    if user.id == current_admin_id:
+        return jsonify({"error": "Vous ne pouvez pas supprimer votre propre compte"}), 403
+
+    user.is_active              = False
+    user.webauthn_credential_id = None
+    user.webauthn_public_key    = None
+    user.image_auth_enabled     = False
+    user.fingerprint_hash       = None
+
+    log_action('admin_deleted_user', 'user', user.id, current_admin_id,
+               details={'soft_delete': True})
+    db.session.commit()
+    return jsonify({"message": f"Utilisateur {user.email} désactivé"}), 200
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROFIL UTILISATEUR (self-service)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@api.get('/users/me')
+@jwt_required()
+def get_my_profile():
+    """
+    Profil de l'utilisateur connecté
+    ---
+    tags: [Utilisateur]
+    security: [{Bearer: []}]
+    responses:
+      200: {description: Profil}
+    """
+    user_id = get_jwt_identity()
+    user    = User.query.get(user_id)
+    if not user:
+        return jsonify({"error": "Utilisateur introuvable"}), 404
+    return jsonify(user.to_dict()), 200
+
+
+@api.put('/users/me')
+@jwt_required()
+def update_my_profile():
+    """
+    Mettre à jour son propre profil (prénom, nom, téléphone)
+    ---
+    tags: [Utilisateur]
+    security: [{Bearer: []}]
+    parameters:
+      - name: body
+        in: body
+        schema:
+          type: object
+          properties:
+            first_name: {type: string}
+            last_name:  {type: string}
+            phone:      {type: string}
+    responses:
+      200: {description: Profil mis à jour}
+      400: {description: Données invalides}
+    """
+    user_id = get_jwt_identity()
+    user    = User.query.get(user_id)
+    if not user:
+        return jsonify({"error": "Utilisateur introuvable"}), 404
+
+    data = request.get_json(silent=True) or {}
+    if 'first_name' in data:
+        user.first_name = data['first_name']
+    if 'last_name' in data:
+        user.last_name = data['last_name']
+    if 'phone' in data:
+        user.phone = data['phone']
+
+    log_action('profile_updated', 'user', user.id, user.id,
+               details={'updated_fields': list(data.keys())})
+    db.session.commit()
+    return jsonify({"message": "Profil mis à jour", "user": user.to_dict()}), 200
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DÉPÔT & RETRAIT (opérations de caisse)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@api.post('/transactions/deposit')
+@jwt_required()
+def deposit():
+    """
+    Dépôt d'argent sur un compte
+    ---
+    tags: [Transactions]
+    security: [{Bearer: []}]
+    parameters:
+      - name: body
+        in: body
+        required: true
+        schema:
+          type: object
+          required: [account_id, amount]
+          properties:
+            account_id:  {type: string, description: "ID du compte crédité"}
+            amount:      {type: number, description: "Montant à déposer (>0)"}
+            description: {type: string, description: "Optionnel, ex: dépôt espèce"}
+    responses:
+      200: {description: Dépôt effectué}
+      400: {description: Montant invalide ou compte introuvable}
+      403: {description: Non autorisé}
+    """
+    user_id    = get_jwt_identity()
+    data       = request.get_json(silent=True) or {}
+    account_id = data.get('account_id')
+
+    try:
+        amount = float(data.get('amount', 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Montant invalide"}), 400
+
+    if not account_id or amount <= 0:
+        return jsonify({"error": "account_id et montant positif requis"}), 400
+
+    account = Account.query.filter_by(id=account_id, user_id=user_id).first()
+    if not account:
+        return jsonify({"error": "Compte introuvable ou non autorisé"}), 403
+
+    old_balance     = float(account.balance)
+    account.balance = old_balance + amount
+
+    txn = Transaction(
+        reference        = generate_transaction_ref(),
+        amount           = amount,
+        currency         = account.currency,
+        transaction_type = 'deposit',
+        status           = 'completed',
+        description      = data.get('description', f"Dépôt de {amount} {account.currency}"),
+        from_account_id  = None,
+        to_account_id    = account_id,
+        completed_at     = datetime.now(timezone.utc)
+    )
+    db.session.add(txn)
+    log_action('deposit', 'account', account_id, user_id,
+               details={'amount': amount, 'old_balance': old_balance,
+                        'new_balance': float(account.balance)})
+    db.session.commit()
+
+    return jsonify({
+        "message":     "Dépôt effectué avec succès",
+        "transaction": txn.to_dict(),
+        "new_balance": float(account.balance)
+    }), 200
+
+
+@api.post('/transactions/withdraw')
+@jwt_required()
+def withdraw():
+    """
+    Retrait d'argent d'un compte
+    ---
+    tags: [Transactions]
+    security: [{Bearer: []}]
+    parameters:
+      - name: body
+        in: body
+        required: true
+        schema:
+          type: object
+          required: [account_id, amount]
+          properties:
+            account_id:  {type: string, description: "ID du compte débiteur"}
+            amount:      {type: number, description: "Montant à retirer (>0)"}
+            description: {type: string, description: "Optionnel"}
+    responses:
+      200: {description: Retrait effectué}
+      400: {description: Montant invalide, solde insuffisant ou compte introuvable}
+      403: {description: Non autorisé}
+    """
+    user_id    = get_jwt_identity()
+    data       = request.get_json(silent=True) or {}
+    account_id = data.get('account_id')
+
+    try:
+        amount = float(data.get('amount', 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Montant invalide"}), 400
+
+    if not account_id or amount <= 0:
+        return jsonify({"error": "account_id et montant positif requis"}), 400
+
+    account = Account.query.filter_by(id=account_id, user_id=user_id).first()
+    if not account:
+        return jsonify({"error": "Compte introuvable ou non autorisé"}), 403
+
+    if float(account.balance) < amount:
+        return jsonify({"error": "Solde insuffisant"}), 400
+
+    old_balance     = float(account.balance)
+    account.balance = old_balance - amount
+
+    txn = Transaction(
+        reference        = generate_transaction_ref(),
+        amount           = amount,
+        currency         = account.currency,
+        transaction_type = 'withdrawal',
+        status           = 'completed',
+        description      = data.get('description', f"Retrait de {amount} {account.currency}"),
+        from_account_id  = account_id,
+        to_account_id    = None,
+        completed_at     = datetime.now(timezone.utc)
+    )
+    db.session.add(txn)
+    log_action('withdrawal', 'account', account_id, user_id,
+               details={'amount': amount, 'old_balance': old_balance,
+                        'new_balance': float(account.balance)})
+    db.session.commit()
+
+    return jsonify({
+        "message":     "Retrait effectué avec succès",
+        "transaction": txn.to_dict(),
+        "new_balance": float(account.balance)
+    }), 200
