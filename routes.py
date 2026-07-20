@@ -1027,143 +1027,364 @@ def update_my_profile():
     db.session.commit()
     return jsonify({"message": "Profil mis à jour", "user": user.to_dict()}), 200
 
+# ── Constantes métier ─────────────────────────────────────────────────────────
+
+CURRENCY_LIMITS = {
+    'XAF': {'min': 100,     'max_single': 5_000_000, 'daily_cap': 20_000_000},
+    'EUR': {'min': 1,       'max_single': 10_000,    'daily_cap': 50_000},
+    'USD': {'min': 1,       'max_single': 10_000,    'daily_cap': 50_000},
+}
+DEFAULT_CURRENCY_LIMIT = {'min': 1, 'max_single': 1_000_000, 'daily_cap': 5_000_000}
+
+# Tranches de frais pour retrait (appliquées en boucle)
+WITHDRAWAL_FEE_TIERS = [
+    {'threshold': 100_000, 'rate': 0.000},   # < 100k XAF : gratuit
+    {'threshold': 500_000, 'rate': 0.005},   # 100k–500k  : 0.5%
+    {'threshold': 2_000_000, 'rate': 0.010}, # 500k–2M    : 1%
+    {'threshold': float('inf'), 'rate': 0.015},  # > 2M   : 1.5%
+]
+
+# Bonus de dépôt (paliers, appliqués en boucle)
+DEPOSIT_BONUS_TIERS = [
+    {'threshold': 1_000_000, 'bonus': 0.000},   # < 1M  : pas de bonus
+    {'threshold': 5_000_000, 'bonus': 0.001},   # 1M–5M : 0.1%
+    {'threshold': float('inf'), 'bonus': 0.002}, # > 5M  : 0.2%
+]
+
+
+def _get_today_volume(account_id: str, txn_type: str) -> float:
+    """Somme des transactions du jour pour un compte donné (dépôts ou retraits)."""
+    start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    total = 0.0
+    if txn_type == 'deposit':
+        txns = Transaction.query.filter(
+            Transaction.to_account_id == account_id,
+            Transaction.transaction_type == 'deposit',
+            Transaction.status == 'completed',
+            Transaction.created_at >= start_of_day
+        ).all()
+    else:
+        txns = Transaction.query.filter(
+            Transaction.from_account_id == account_id,
+            Transaction.transaction_type == 'withdrawal',
+            Transaction.status == 'completed',
+            Transaction.created_at >= start_of_day
+        ).all()
+    for t in txns:                   # for #1 : itération sur les transactions du jour
+        total += float(t.amount)
+    return total
+
+
+def _compute_withdrawal_fee(amount: float, currency: str) -> float:
+    """
+    Calcule les frais de retrait par application séquentielle des tranches.
+    Contient une boucle for #2 pour parcourir WITHDRAWAL_FEE_TIERS.
+    """
+    if currency != 'XAF':           # frais uniquement sur XAF pour simplifier
+        return 0.0
+    fee = 0.0
+    for tier in WITHDRAWAL_FEE_TIERS:   # for #2
+        if amount < tier['threshold']:
+            fee = amount * tier['rate']
+            break
+    return round(fee, 2)
+
+
+def _compute_deposit_bonus(amount: float, currency: str) -> float:
+    """
+    Calcule le bonus de fidélité sur dépôt.
+    Contient une boucle for #3 pour parcourir DEPOSIT_BONUS_TIERS.
+    """
+    if currency != 'XAF':
+        return 0.0
+    bonus = 0.0
+    for tier in DEPOSIT_BONUS_TIERS:    # for #3
+        if amount < tier['threshold']:
+            bonus = amount * tier['bonus']
+            break
+    return round(bonus, 2)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DÉPÔT & RETRAIT (opérations de caisse)
+# DÉPÔT — CFG enrichi
 # ══════════════════════════════════════════════════════════════════════════════
 
 @api.post('/transactions/deposit')
 @jwt_required()
 def deposit():
     """
-    Dépôt d'argent sur un compte
-    ---
-    tags: [Transactions]
-    security: [{Bearer: []}]
-    parameters:
-      - name: body
-        in: body
-        required: true
-        schema:
-          type: object
-          required: [account_id, amount]
-          properties:
-            account_id:  {type: string, description: "ID du compte crédité"}
-            amount:      {type: number, description: "Montant à déposer (>0)"}
-            description: {type: string, description: "Optionnel, ex: dépôt espèce"}
-    responses:
-      200: {description: Dépôt effectué}
-      400: {description: Montant invalide ou compte introuvable}
-      403: {description: Non autorisé}
-    """
-    user_id    = get_jwt_identity()
-    data       = request.get_json(silent=True) or {}
-    account_id = data.get('account_id')
+    Dépôt d'argent avec validations enrichies.
 
+    Nœuds du CFG :
+      N1  Entrée / lecture JSON
+      N2  Validation account_id présent ?        → N3 (non) | N4 (oui)
+      N3  400 account_id requis                  [exit]
+      N4  Parse amount (try/except)              → N5 (exc) | N6 (ok)
+      N5  400 Montant invalide                   [exit]
+      N6  amount > 0 ?                           → N7 (non) | N8 (oui)
+      N7  400 Montant doit être positif          [exit]
+      N8  Compte existe & appartient à user ?    → N9 (non) | N10 (oui)
+      N9  403 Compte introuvable                 [exit]
+      N10 Compte actif ?                         → N11 (non) | N12 (oui)
+      N11 403 Compte désactivé                   [exit]
+      N12 Récupérer les limites devise (dict)
+      N13 amount < min devise ?                  → N14 (oui) | N15 (non)
+      N14 400 Montant trop faible                [exit]
+      N15 amount > max_single ?                  → N16 (oui) | N17 (non)
+      N16 400 Plafond par opération dépassé      [exit]
+      N17 Calculer volume journalier (for #1)
+      N18 today_vol + amount > daily_cap ?       → N19 (oui) | N20 (non)
+      N19 400 Plafond journalier dépassé         [exit]
+      N20 Calculer bonus (for #3)
+      N21 bonus > 0 ?                            → N22 (oui) | N23 (non)
+      N22 Ajouter bonus au montant effectif
+      N23 Créditer le compte, créer transaction
+      N24 200 Succès                             [exit]
+    """
+    user_id = get_jwt_identity()
+    data    = request.get_json(silent=True) or {}
+
+    # N2 — validation account_id
+    account_id = data.get('account_id')
+    if not account_id:                                          # N3
+        return jsonify({"error": "account_id requis"}), 400
+
+    # N4/N5 — parse amount
     try:
         amount = float(data.get('amount', 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError):                             # N5
         return jsonify({"error": "Montant invalide"}), 400
 
-    if not account_id or amount <= 0:
-        return jsonify({"error": "account_id et montant positif requis"}), 400
+    # N6/N7 — montant positif
+    if amount <= 0:                                             # N7
+        return jsonify({"error": "Montant doit être positif"}), 400
 
+    # N8/N9 — vérifier propriété du compte (expire cache ORM pour lire l'état DB frais)
+    db.session.expire_all()
     account = Account.query.filter_by(id=account_id, user_id=user_id).first()
-    if not account:
+    if not account:                                             # N9
         return jsonify({"error": "Compte introuvable ou non autorisé"}), 403
 
+    # N10/N11 — compte actif ?
+    if not account.is_active:                                   # N11
+        return jsonify({"error": "Compte désactivé"}), 403
+
+    # N12 — limites de la devise
+    limits = CURRENCY_LIMITS.get(account.currency, DEFAULT_CURRENCY_LIMIT)
+
+    # N13/N14 — minimum
+    if amount < limits['min']:                                  # N14
+        return jsonify({"error": f"Montant minimum : {limits['min']} {account.currency}"}), 400
+
+    # N15/N16 — plafond par opération
+    if amount > limits['max_single']:                           # N16
+        return jsonify({"error": f"Plafond par opération : {limits['max_single']} {account.currency}"}), 400
+
+    # N17 — volume journalier (contient for #1)
+    today_vol = _get_today_volume(account_id, 'deposit')
+
+    # N18/N19 — plafond journalier
+    if today_vol + amount > limits['daily_cap']:                # N19
+        remaining = limits['daily_cap'] - today_vol
+        return jsonify({
+            "error": f"Plafond journalier dépassé. Reste disponible : {max(remaining, 0):.0f} {account.currency}"
+        }), 400
+
+    # N20 — bonus de fidélité (contient for #3)
+    bonus = _compute_deposit_bonus(amount, account.currency)
+
+    # N21/N22 — appliquer bonus si > 0
+    effective_amount = amount
+    if bonus > 0:                                               # N22
+        effective_amount = amount + bonus
+
+    # N23 — créditer
     old_balance     = float(account.balance)
-    account.balance = old_balance + amount
+    account.balance = old_balance + effective_amount
+
+    description = data.get('description') or f"Dépôt de {amount} {account.currency}"
+    if bonus > 0:
+        description += f" (+ {bonus} bonus fidélité)"
 
     txn = Transaction(
         reference        = generate_transaction_ref(),
-        amount           = amount,
+        amount           = effective_amount,
         currency         = account.currency,
         transaction_type = 'deposit',
         status           = 'completed',
-        description      = data.get('description', f"Dépôt de {amount} {account.currency}"),
+        description      = description,
         from_account_id  = None,
         to_account_id    = account_id,
         completed_at     = datetime.now(timezone.utc)
     )
     db.session.add(txn)
     log_action('deposit', 'account', account_id, user_id,
-               details={'amount': amount, 'old_balance': old_balance,
+               details={'amount': amount, 'bonus': bonus,
+                        'effective_amount': effective_amount,
+                        'old_balance': old_balance,
                         'new_balance': float(account.balance)})
     db.session.commit()
 
+    # N24
     return jsonify({
-        "message":     "Dépôt effectué avec succès",
-        "transaction": txn.to_dict(),
-        "new_balance": float(account.balance)
+        "message":          "Dépôt effectué avec succès",
+        "transaction":      txn.to_dict(),
+        "bonus_applied":    bonus,
+        "effective_amount": effective_amount,
+        "new_balance":      float(account.balance)
     }), 200
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RETRAIT — CFG enrichi
+# ══════════════════════════════════════════════════════════════════════════════
 
 @api.post('/transactions/withdraw')
 @jwt_required()
 def withdraw():
     """
-    Retrait d'argent d'un compte
-    ---
-    tags: [Transactions]
-    security: [{Bearer: []}]
-    parameters:
-      - name: body
-        in: body
-        required: true
-        schema:
-          type: object
-          required: [account_id, amount]
-          properties:
-            account_id:  {type: string, description: "ID du compte débiteur"}
-            amount:      {type: number, description: "Montant à retirer (>0)"}
-            description: {type: string, description: "Optionnel"}
-    responses:
-      200: {description: Retrait effectué}
-      400: {description: Montant invalide, solde insuffisant ou compte introuvable}
-      403: {description: Non autorisé}
-    """
-    user_id    = get_jwt_identity()
-    data       = request.get_json(silent=True) or {}
-    account_id = data.get('account_id')
+    Retrait avec validations enrichies et calcul de frais par tranches.
 
+    Nœuds du CFG :
+      N1  Entrée / lecture JSON
+      N2  account_id présent ?                   → N3 (non) | N4 (oui)
+      N3  400 account_id requis                  [exit]
+      N4  Parse amount                           → N5 (exc) | N6 (ok)
+      N5  400 Montant invalide                   [exit]
+      N6  amount > 0 ?                           → N7 (non) | N8 (oui)
+      N7  400 Montant doit être positif          [exit]
+      N8  Compte existe & appartient à user ?    → N9 (non) | N10 (oui)
+      N9  403 Compte introuvable                 [exit]
+      N10 Compte actif ?                         → N11 (non) | N12 (oui)
+      N11 403 Compte désactivé                   [exit]
+      N12 Limites devise
+      N13 amount < min ?                         → N14 (oui) | N15 (non)
+      N14 400 Montant trop faible                [exit]
+      N15 amount > max_single ?                  → N16 (oui) | N17 (non)
+      N16 400 Plafond par opération              [exit]
+      N17 Calculer frais (for #2)
+      N18 balance >= amount + fee ?              → N19 (non) | N20 (oui)
+      N19 400 Solde insuffisant (avec frais)     [exit]
+      N20 Volume journalier (for #1)
+      N21 today_vol + amount > daily_cap ?       → N22 (oui) | N23 (non)
+      N22 400 Plafond journalier                 [exit]
+      N23 fee > 0 ?                              → N24 (oui) | N25 (non)
+      N24 Créer transaction frais séparée
+      N25 Débiter compte, créer transaction principale
+      N26 200 Succès                             [exit]
+    """
+    user_id = get_jwt_identity()
+    data    = request.get_json(silent=True) or {}
+
+    # N2/N3
+    account_id = data.get('account_id')
+    if not account_id:
+        return jsonify({"error": "account_id requis"}), 400
+
+    # N4/N5
     try:
         amount = float(data.get('amount', 0))
     except (TypeError, ValueError):
         return jsonify({"error": "Montant invalide"}), 400
 
-    if not account_id or amount <= 0:
-        return jsonify({"error": "account_id et montant positif requis"}), 400
+    # N6/N7
+    if amount <= 0:
+        return jsonify({"error": "Montant doit être positif"}), 400
 
+    # N8/N9
+    db.session.expire_all()
     account = Account.query.filter_by(id=account_id, user_id=user_id).first()
     if not account:
         return jsonify({"error": "Compte introuvable ou non autorisé"}), 403
 
-    if float(account.balance) < amount:
-        return jsonify({"error": "Solde insuffisant"}), 400
+    # N10/N11
+    if not account.is_active:
+        return jsonify({"error": "Compte désactivé"}), 403
 
+    # N12
+    limits = CURRENCY_LIMITS.get(account.currency, DEFAULT_CURRENCY_LIMIT)
+
+    # N13/N14
+    if amount < limits['min']:
+        return jsonify({"error": f"Montant minimum : {limits['min']} {account.currency}"}), 400
+
+    # N15/N16
+    if amount > limits['max_single']:
+        return jsonify({"error": f"Plafond par opération : {limits['max_single']} {account.currency}"}), 400
+
+    # N17 — calcul frais (contient for #2)
+    fee = _compute_withdrawal_fee(amount, account.currency)
+    total_debit = amount + fee
+
+    # N18/N19
+    if float(account.balance) < total_debit:
+        return jsonify({
+            "error": "Solde insuffisant",
+            "balance":    float(account.balance),
+            "requested":  amount,
+            "fee":        fee,
+            "total_needed": total_debit
+        }), 400
+
+    # N20 — volume journalier (contient for #1)
+    today_vol = _get_today_volume(account_id, 'withdrawal')
+
+    # N21/N22
+    if today_vol + amount > limits['daily_cap']:
+        remaining = limits['daily_cap'] - today_vol
+        return jsonify({
+            "error": f"Plafond journalier de retrait dépassé. Reste : {max(remaining, 0):.0f} {account.currency}"
+        }), 400
+
+    # N23/N24 — transaction de frais séparée si fee > 0
     old_balance     = float(account.balance)
-    account.balance = old_balance - amount
+    account.balance = old_balance - total_debit
 
+    fee_txn = None
+    if fee > 0:                                                 # N24
+        fee_txn = Transaction(
+            reference        = generate_transaction_ref(),
+            amount           = fee,
+            currency         = account.currency,
+            transaction_type = 'fee',
+            status           = 'completed',
+            description      = f"Frais de retrait sur {amount} {account.currency}",
+            from_account_id  = account_id,
+            to_account_id    = None,
+            completed_at     = datetime.now(timezone.utc)
+        )
+        db.session.add(fee_txn)
+
+    # N25
+    description = data.get('description') or f"Retrait de {amount} {account.currency}"
     txn = Transaction(
         reference        = generate_transaction_ref(),
         amount           = amount,
         currency         = account.currency,
         transaction_type = 'withdrawal',
         status           = 'completed',
-        description      = data.get('description', f"Retrait de {amount} {account.currency}"),
+        description      = description,
         from_account_id  = account_id,
         to_account_id    = None,
         completed_at     = datetime.now(timezone.utc)
     )
     db.session.add(txn)
     log_action('withdrawal', 'account', account_id, user_id,
-               details={'amount': amount, 'old_balance': old_balance,
+               details={'amount': amount, 'fee': fee,
+                        'total_debit': total_debit,
+                        'old_balance': old_balance,
                         'new_balance': float(account.balance)})
     db.session.commit()
 
-    return jsonify({
+    # N26
+    response = {
         "message":     "Retrait effectué avec succès",
         "transaction": txn.to_dict(),
+        "fee":         fee,
+        "total_debit": total_debit,
         "new_balance": float(account.balance)
-    }), 200
+    }
+    if fee_txn:
+        response["fee_transaction"] = fee_txn.to_dict()
+
+    return jsonify(response), 200
